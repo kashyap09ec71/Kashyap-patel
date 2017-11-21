@@ -1,0 +1,530 @@
+// Include all libraries
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <ctype.h>
+#include <avr/io.h>
+#include <avr/interrupt.h>
+#include <avr/pgmspace.h>
+
+// if you want add your CPU clock
+/*#ifndef F_CPU
+#define F_CPU 1000000UL
+#endif */
+
+// Port C Pin Assignments
+#define SENSE_1	0
+#define SENSE_2	1
+
+// Port D Pin Assignments
+#define	M1_P	2
+#define M1_N	3
+#define M2_P	4
+#define M2_N	7
+
+// Port B Pin Assignments
+#define PWM1	1
+#define PWM2	2
+#define MOSI	3
+#define MISO	4
+#define SCK		5
+
+// Set one function for forward and reverse direction for motor
+#define sbi(var, mask)   ((var) |= (uint8_t)(1 << mask))
+#define cbi(var, mask)   ((var) &= (uint8_t)~(1 << mask))
+#define M1_FORWARD()	sbi(PORTD, M1_P);cbi(PORTD, M1_N)    // PORTD |= (uint8_t)(1<<2);  PORTD &= (uint8_t)~(1<<3)
+#define M1_REVERSE()	sbi(PORTD, M1_N);cbi(PORTD, M1_P)    // PORTD |= (uint8_t)(1<<3); PORTD &= (uint8_t)~(1<<2)
+#define M2_FORWARD()	sbi(PORTD, M2_P);cbi(PORTD, M2_N)    // PORTD |= (uint8_t)(1<<2);  PORTD &= (uint8_t)~(1<<3)
+#define M2_REVERSE()	sbi(PORTD, M2_N);cbi(PORTD, M2_P)    // PORTD |= (uint8_t)(1<<3); PORTD &= (uint8_t)~(1<<2)
+
+
+void ioinit(void);
+void set_direction(char direcion);
+void delay_ms(uint16_t x);
+void delay_us(uint16_t x);
+
+//Add some variable for program use
+volatile int current_thresold;                                       // to check high current limit
+volatile int current_thresold_2 = 78;                                // for reverse side
+volatile int current_thresold_1 = 105;                               // for forward side
+volatile char Current_Ok=1;                                          // if current is overflow clear this flag?
+volatile int c_a = 0;                                                // for high current detect
+
+volatile int reset= 0;                                               // to set flag if low current in forward
+volatile int reset1= 0;                                              // to set flag if low current in reverse
+
+volatile int data;                                                   // to get ADC data
+volatile int data2 = 0;                                              // to detect low current in reverse direction of motor
+volatile int data3 = 0;                                              // to detect low current in forward direction of motor
+volatile  int current_average =10;                                   // to get ADC average of some samples
+volatile char Current_Flag=0;                                        // to check high-current set this flag
+volatile  int N = 1;                                                 // for ADC sampling
+
+volatile int motor_start = 0;                                        // command to start the motor
+volatile int reverse_start = 0;                                      // command to reverse the motor after emergency
+volatile int dir = 2;                                                // to get in which direction motor is moving 1:forward 0:reverse 
+                                                    
+volatile char Blink=0;                                               // command to start led blinking
+volatile int Ticks =0;                                               // command to count number of ticks
+volatile int LED_blink = 0;                     
+                                   
+volatile int door_open = 0;                                          // to check emergency door open status
+
+
+// Starting of main code
+int main(void)
+{
+	int debounce=0;                                                  // debounce counter
+	char button_state=0;                                             // button state
+	char door_state = 0;                                             // to check door is open or not?
+	char Compacter_Sate =0;                                          // to check motor state
+	int ramp=0;                                                      // for ramp up the motor
+	
+	sei();                                                           // Enable the Global interrupt
+	ioinit();                                                        // Input-Output, ADC, timer Initialization
+	
+	Compacter_Sate =0;                                               // motor on ideal state
+	while (1)
+	{
+		
+		// check if door is open or not?
+		switch (door_state)                                    
+		{
+			case 0:                                                  // to check the door, is it open or not?
+			if(PINC & (1<<3))                                        // it is on pin PC3
+			{
+				OCR1A = 0;                                           // if yes then stop the motor 
+				OCR1B = 0;
+				button_state = 0;                                    // button state at ideal
+				Compacter_Sate = 0;                                  // motor at ideal
+				reverse_start = 1;                      	
+				door_state = 0;                                      // check every time
+				LED_blink = 0;                                       // stop LEd blinking
+				PORTC &= ~(1<<4);                                    // stop both LED 4 and 2
+	            PORTC &= ~(1<<2);
+				door_open = 1;                                       // set emergency door open state
+				data2 = 0;                                           // ADC data count for low current set to zero
+				data3 = 0;
+				dir = 2;                                             // no forward no reverse direction
+			}
+			else
+			    door_state = 0;                                      // check every time
+				if(reverse_start)
+				{
+					reverse_start =0;
+				}
+			break;
+
+
+			default:
+			door_state = 0;                                          // check door status
+			break;
+
+		}
+		
+
+		// check if switch or push button is on or off and debounce button?
+		switch (button_state)
+		{
+			case 0:                                                  // button first pushed
+			debounce=0;                                              // counter debounce first as zero
+			if(PINC & (1<<5))                                        // check the button is pushed or not?
+		 	{
+				button_state=1;                                      // if button is pushed then go in case 1	
+			}
+			break;
+
+
+			case 1:                                                  // debounce button
+			if(PINC & (1<<5))                                        // if button is not released or not?
+			{
+				if(++debounce > 20 )                                 // if it is not released then wait for some time
+				button_state=2;                                      // after some time go in case 2
+			}
+			else                                                    
+				button_state = 0;                                    // start over                             
+			break;
+
+			case 2:                                                  // wait here until button is released
+			button_state=3;                                          // wait and check one more time
+			debounce=0;
+			break;
+			
+			case 3:                                                  // wait until button is released
+			if(PINC & (1<<5))
+				button_state=3;                                      // wait
+			else
+			{
+				if(door_open)                                        // to check emergency door open before switch press
+				{
+					Compacter_Sate = 5;                              // if yes than motor goes on reverse
+					door_open = 0;                                   // make it clear
+					button_state = 0;                                // button state to ideal
+				}
+				else
+				{
+					motor_start = 1;                                     // if button is released then start the motor
+					button_state=0;                                      // if released then debounce off time
+				}	
+			}
+			break;
+			
+			case 4:                                                  // debounce off time
+			if(PINC & (1<<5))                                        // if button is one more time pushed then wait
+			{
+				button_state=4;                                      // wait
+				debounce =0;
+			}
+			else
+			if(++debounce > 500 )                                    // if not then wait some time and check it from starting
+				button_state=0;
+			break;
+
+			default:                                                 // default in checking case
+			button_state=3;
+			break;
+		}
+
+
+
+        // for motor control on forward and reverse
+		switch( Compacter_Sate )                                     // for motor control
+		{
+			case 0:                                                  // wait here until get command to start
+			Blink=0;                                                 // stop blinking led
+			if(motor_start )
+			{
+				Compacter_Sate = 1;                                  // if motor_start than goes in forward 
+				motor_start=0;
+			}
+			break;
+
+			case 1:                                                  // start motor
+			Blink=1;                                                 // start blinking led
+			set_direction('f');                                      // set motor direction as forward
+			Compacter_Sate=2;                                        // start motor ramp up
+			current_thresold = current_thresold_1;                   // set current_thresolf for high current
+			ramp=400;                                                // set ramp up at around 40%
+			data3 = 0;                                               // set count of low_current to zero
+			data2 = 0;                                               // set count of low_current to zero
+			reset = 0;                                         
+			break;
+
+			case 2:                                                  // motor forward ramp up and current monitor
+			Current_Flag=0;
+			LED_blink = 1;                                           // led blink when motor is operating
+			dir = 1;                                                 // set to indicate motor is on forward
+			if(Current_Ok)                                           // if no high current
+			{
+				if(++ramp<970 && (reset == 0))                       // ramp-up motor and check low_cuurent
+				{
+					//data3 = 0;
+					OCR1A = ramp++;
+					OCR1B = ramp++;
+					Compacter_Sate=2;                                // motor forward ramp up and current monitor
+				}
+				else if (reset == 1)                                 // if low_cuurnt detect
+				{
+					reset = 0;                                       
+				    Compacter_Sate = 4;                              // state goes to reverse direction
+				    OCR1A = 0;                                       // stop motor
+				    OCR1B = 0;
+				    LED_blink = 0;                                   // led off when motor is not operating
+				    PORTC &= ~(1<<4);                                // led off
+				    Ticks = 0;                                       // reset tick of timer
+				}
+				else
+				{
+				    Compacter_Sate=3;                                // motor steady state wait for time out or over current
+					Ticks=0;                                        
+				}	
+			}
+			else
+			{
+				Compacter_Sate=3;                                    // over current in forward direction motor stop goto to reverse
+			    Ticks=0;
+			}
+			break;
+
+			case 3:                                                  // motor steady state wait for time out or over current
+			LED_blink = 1;                                           // led blink when motor is operating
+			Current_Flag=1;                                          // to check over current detect or not
+			if((Current_Ok) &&  (reset == 0))                        // check high and low current
+			{
+				if(Ticks < 80)                                       // wait up to 20 sec. 
+					Compacter_Sate=3;                                // motor steady state wait for time out or over current
+				else
+				{
+					Compacter_Sate=4;                                // stop motor and start reversing					
+					Ticks=0;                                       
+					reset = 0;                                       // reset ADC low value counting
+					OCR1A = 0;                                       // stop motor
+					OCR1B = 0;
+					dir = 2;
+				}
+			}
+			else
+			{
+				Current_Ok=1;                                        // set high current check flag
+				Compacter_Sate=4;                                    // stop motor and start reversing                    
+				Ticks=0;
+			    reset = 0;
+				OCR1A = 0;                                           // stop motor
+				OCR1B = 0;
+				dir = 2;
+			}
+			break;
+
+			case 4:                                                  // delay and start reversing motor
+			LED_blink = 0;                                           // led off when motor is stop
+			PORTC &= ~(1<<4);                                        // led off
+			if(Ticks < 20)                                           // wait up to 20 sec.
+				Compacter_Sate=4;
+			else
+				Compacter_Sate = 5;
+			break;
+
+			case 5:												     // start motor reverse 
+			set_direction('r');                                      // set motor direction as reverse
+			Compacter_Sate=6;                                        // start motor ramp up
+			current_thresold  = current_thresold_2;                  // set current threshold
+			data3 = 0;
+			data2 = 0;
+			ramp=400;
+			break;
+
+			case 6:                                                  // motor reverse ramp up and current monitor
+			Current_Flag = 0;
+			LED_blink = 1;                                           // led blink when motor is operating
+			dir = 0;                                                 // indicate motor in reverse
+			if(Current_Ok)                                           // if no high current
+			{ 
+				if(++ramp<970 && (reset1 == 0))                      // ramp up and check low current
+				{
+					//data2 = 0;
+					OCR1A = ramp++;
+					OCR1B = ramp++;
+					Compacter_Sate=6;                                // motor reverse ramp up and current monitor
+				}
+				else if(reset1 == 1)                                 // if low current detect
+				{
+			        reset1 = 0;        
+					Compacter_Sate = 0;                              // motor goes in ideal
+					OCR1A = 0;                                       // stop motor
+					OCR1B = 0;
+					LED_blink = 0;                                   // led off when motor is not operating
+					PORTC &= ~(1<<4);                                // led off
+				}
+				else
+				{
+					Compacter_Sate=7;                                // motor steady state wait for time out or over current
+					Ticks = 0;
+				}
+			}
+			else
+			{
+				Compacter_Sate=7;                                    // over current in reverse direction motor stop
+				Ticks=0;
+			}
+			break;
+
+			case 7:                                                 // motor steady state reverse wait for time out or over current
+			Current_Flag=1;
+			LED_blink = 1;                                          // led blink when motor is operating
+			if((Current_Ok) && (reset1 == 0))                       // if no low or high current detect
+			{
+				if(Ticks < 80)                                      // wait up to 20 sec
+					Compacter_Sate=7;                               // motor steady reverse state wait for time out or over current
+				else
+				{
+					Compacter_Sate=0;                               // stop motor new cycle
+					dir = 2;                                        // no forward no reverse
+					Ticks=0;
+					OCR1A = 0;                                      // stop motor
+					OCR1B = 0;
+					LED_blink = 0;                                  // led off when motor is not operating
+					PORTC &= ~(1<<4);                               // led off
+					motor_start = 0;
+				}
+			}
+			else
+			{
+				dir = 2;                                            // no forward no reverse
+				Current_Ok = 1;                 
+				Compacter_Sate = 0;                                 // stop motor and new cycle
+				Ticks=0;
+				reset1 = 0;  
+				OCR1A = 0;                                          // stop motor
+				OCR1B = 0;
+				LED_blink = 0;                                      // led off when motor is not operating
+				PORTC &= ~(1<<4);                                   // led off
+				motor_start = 0;
+			}
+			break;
+			
+			default:
+			Compacter_Sate = 4;                                     // default is reverse
+		}
+	}                       // while loop
+}                           // main loop                                               
+
+
+// interrupt service routine
+ISR(ADC_vect)
+{
+	data = ADCL;                                                    // take ADC value
+	data |= (8<<ADCH);
+
+    // average filter for ADC value
+	if(N < 15)                                                      // simple average filter
+	{
+		current_average = (current_average*(N-1) + data)/N;
+		N++;
+	}
+	else
+	{
+		N = 1;
+		current_average = (current_average + data)/2;
+	}
+	
+	// to detect low current 	
+    if(dir == 1)                                                    // for forward direction
+	{
+	   if(current_average <= 14)                                    // if current_average is less or equal than 14
+	   {
+		   data3++;                                                 // increase data3
+		  
+	   }
+	   if(data3 >= 800)                                             // when data3 become over 800
+	   {
+		   data3= 0;
+		   reset = 1;                                               // set reset to go motor in reverse 
+	   }
+	}
+	else if(dir == 0)                                               // for reverse direction
+	{
+	   if(current_average <= 14)                      
+	   {
+		   data2++;
+	   }
+	   if(data2 >= 1000)
+	   {
+		   data2 = 0;
+		   reset1 = 1;
+	   }	
+	}
+	else
+	{
+		data2 = 0;
+		data3 = 0;
+	}
+	
+	// to detect high current
+    if((current_average >= current_thresold) && Current_Flag )      // make sure current is under threshold
+	{
+	     c_a++;
+	}
+	if(c_a > 10)
+	{
+         c_a = 0;
+		 OCR1A = 0;                                                 // stop motor
+		 OCR1B = 0;
+		 Current_Ok=0;
+	}
+}
+
+
+ISR(TIMER0_OVF_vect)
+{
+	if(LED_blink == 1)
+	{
+	   PORTC ^= (1<<4);
+	}
+	static int Led_Cnt=0;
+	
+	Ticks++;
+
+	if(++Led_Cnt >305 && Blink)                                     // up to 5 seconds
+	{
+		PORTC ^= (1<<2);                                            // led2 blink
+		Led_Cnt=0;
+	}
+	
+	if(!Blink)
+		PORTC |= (1<<2);                                            // led2 on
+	
+}
+
+
+// Input-Output, ADC, Timer Initialization
+void ioinit()
+{
+	DDRB = (1<<PWM1)|(1<<MOSI)|(1<<SCK)|(1<<PWM2);	                // Enable PWM1 and SPI pins as outputs
+	PORTB = (1<<MISO);	                                            // Enable pull-up on MISO
+	DDRD = 0xFF;	                                                // Set Port D to all outputs
+	DDRC = 0x14;                                                    // c2,c4 output (LEDs) , c3,c5 switch as input
+	PORTC &= ~(1<<4);
+	PORTC |= (1<<5) | (1<<0) | (1<<3);                              // enable the pull-up register on ADC0 and switch pin and door LED
+    
+	//Timer 0 Initialization
+	TCCR0A = 0x00;
+	TCCR0B |= (1 << CS00) | (1 << CS02);                            // prescaler 1:1024
+	TCNT0 = 0;
+	TIMSK0 |= (1 << TOIE0);                                         // Enable timer 0 interrupt
+	TIFR0 = (1 << TOV0);                                            // flag will set when timer 0  is overflow
+	
+	// Initialize Timer 1 for 10 BIT Fast Mode PWM with output toggle on OC1A and OC1B
+	TCCR1A = (1<<COM1A1) | (1<<COM1B1);                             // Set toggle mode for PWM pins
+	TCCR1A |= (1<<WGM10) | (1<<WGM11);                              // set 10bit fast PWM mode
+	TCCR1B |= (1<<WGM12);
+	TCCR1B &= ~(1<<WGM13);                                               
+	TCCR1B |= (1<<CS10);                                            // no prescaling
+	OCR1A = 0;                                                      // first set as 0 for PWM signal
+	OCR1B = 0;
+	
+	// Initialize timer 2 for delay function
+	TCCR2B = (1<<CS20); 	                                        // no prescaling
+	
+	//Initialize the ADC for Free Running Reads to control motor shut-down in case of over current
+	ADMUX |= (1<<REFS0);                                            // AVCC with external capacitor at AREF pin
+	ADCSRA |= (1<<ADATE) | (1<<ADIE) | (1<<ADPS2) | (1<<ADIF);      // Auto-trigger, enable interrupt flag, prescaler 16, interrupt flag disable by writing 1
+	ADCSRA |= (1<<ADEN);                                            // ADC enable
+	ADCSRA |= (1<<ADSC);                                            // start ADC	
+}
+
+// motor direction
+void set_direction(char direction)                                  // function for motor direction
+{
+	if(direction == 'f')                                            // forward direction
+	{
+		M1_FORWARD();
+		M2_FORWARD();
+	}
+	else                                                            // reverse direction
+	{
+		M1_REVERSE();
+		M2_REVERSE();
+	}
+}
+
+// millisecond delay
+void delay_ms(uint16_t x)                                           // delay function for millisecond delay
+{
+	for (; x > 0 ; x--)
+	delay_us(1000);
+}
+
+
+// microsecond delay
+void delay_us(uint16_t x)                                           // delay for microsecond delay using timer2
+{
+	TIFR2 = (1<<TOV2);                                              // Clear any interrupt flags on Timer2
+	TCNT2= 240;                                                     // Setting counter to 239 will make it 16 ticks until TOV is set. .0625uS per click means 1 uS until TOV is set
+	while(x>0)
+	{
+		while( (TIFR2 & (1<<TOV2)) == 0);                           // wait until timer2 overflow
+		TIFR2 = (1<<TOV2);                                          // Clear any interrupt flags on Timer2
+		TCNT2=240;                                                  // set counter one more time
+		x--;                                                        // decrease up to zero
+	}
+}
